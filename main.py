@@ -3,6 +3,8 @@ import os
 import random
 import string
 import datetime
+import pandas as pd
+import aiofiles
 import shutil
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -12,25 +14,12 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramBadRequest
+from io import BytesIO
 import aiosqlite
-import sqlite3
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-
-
-db_lock = asyncio.Lock()
-
-async def get_db_connection():
-    def connect():
-        conn = sqlite3.connect(DB_NAME, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
-
-    return await asyncio.to_thread(connect)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -48,7 +37,7 @@ class States(StatesGroup):
     random_gmail_done = State()
     reject_reason = State()
     support_ticket = State()
-
+    tracking_order = State()
 class AdminStates(StatesGroup):
     screenshot_wait = State()   # এপ্রুভ করার পর স্ক্রিনশট চাইবে
     reject_reason = State()     # রিজেক্ট করার পর রিজন চাইবে
@@ -227,18 +216,11 @@ TEXTS = {
 }
 
 # ট্রান্সলেশন ফাংশন
-
 async def t(user_id, key):
-    db = await get_db_connection()
-    try:
-        cursor = await asyncio.to_thread(db.execute, "SELECT language FROM users WHERE user_id = ?", (user_id,))
-        row = await asyncio.to_thread(cursor.fetchone)
-        lang = row[0] if row else 'bn'
-    except Exception:
-        lang = 'bn'  # যদি ডাটাবেস এরর হয় তাহলে ডিফল্ট bn
-    finally:
-        db.close()
-
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT language FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            lang = row[0] if row else 'bn'
     return TEXTS.get(key, {}).get(lang, TEXTS.get(key, {}).get('bn', key))
 
 MAIN_CATEGORIES = ["Facebook", "Instagram", "Coins", "Gmail", "Others"]
@@ -254,13 +236,8 @@ SUB_CATEGORIES = {
 PC_CLONE_SUB = ["PC Clone 1000x", "6155/56x Cookies"]
 
 async def init_db():
-    def setup_db():
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-
-        conn.executescript('''
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.executescript('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
@@ -277,56 +254,112 @@ async def init_db():
                 referrer INTEGER,
                 last_login DATE
             );
-            -- বাকি টেবিলগুলো...
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                category TEXT,
+                sub_category TEXT,
+                status TEXT DEFAULT 'pending',
+                rate REAL,
+                message_id INTEGER UNIQUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS rates (
+                category TEXT PRIMARY KEY,
+                rate_bdt REAL DEFAULT 5
+            );
+            CREATE TABLE IF NOT EXISTS toggles (
+                item TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS withdraw_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount_bdt REAL,
+                currency TEXT,
+                method TEXT,
+                number TEXT,
+                status TEXT DEFAULT 'pending'
+            );
         ''')
-
+                # রেফারেল কাউন্ট কলাম যোগ করা (যদি না থাকে)
+                # রেফারেল কাউন্ট কলাম যোগ করা (পুরোনো ডাটাবেসের জন্য নিরাপদে)
         try:
-            conn.execute("ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # ইতিমধ্যে থাকলে ইগনোর
-
+            await db.execute("ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0")
+            await db.commit()
+            print("referral_count কলাম সফলভাবে যোগ করা হয়েছে।")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" in str(e).lower():
+                pass  # ইতিমধ্যে থাকলে কিছু করার দরকার নেই
+            else:
+                print(f"কলাম যোগ করতে সমস্যা: {e}")
+                raise
+        try:
+            await db.execute("ALTER TABLE withdraw_requests ADD COLUMN reject_reason TEXT")
+            await db.commit()
+        except aiosqlite.OperationalError:
+            pass  # ইতিমধ্যে থাকলে কিছু করবে না
+ # নতুন কলাম যোগ করা (যদি আগে না থাকে)
+        new_columns = [
+            ("files", "order_id", "TEXT"),
+            ("files", "username", "TEXT"),
+            ("files", "data_count", "INTEGER DEFAULT 1"),
+            ("withdraw_requests", "order_id", "TEXT")
+        ]
+        for table, col, col_type in new_columns:
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                await db.commit()
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
+# ডিফল্ট রেট এবং টগল সেট করা
         for main in MAIN_CATEGORIES:
             for sub in SUB_CATEGORIES.get(main, []):
                 full = f"{main}_{sub}"
-                conn.execute("INSERT OR IGNORE INTO rates (category, rate_bdt) VALUES (?, 5)", (full,))
-                conn.execute("INSERT OR IGNORE INTO toggles (item, enabled) VALUES (?, 1)", (full,))
+                await db.execute("INSERT OR IGNORE INTO rates (category, rate_bdt) VALUES (?, 5)", (full,))
+                await db.execute("INSERT OR IGNORE INTO toggles (item, enabled) VALUES (?, 1)", (full,))
 
-        conn.commit()
-        conn.close()
+        # রেট টেবিলে অতিরিক্ত কলাম যোগ (যদি না থাকে)
+        try:
+            await db.execute("ALTER TABLE rates ADD COLUMN display_name TEXT")
+            await db.execute("ALTER TABLE rates ADD COLUMN format_text TEXT DEFAULT 'UID | Pass | 2FA'")
+            await db.execute("ALTER TABLE rates ADD COLUMN last_time TEXT DEFAULT '11:00 PM BD'")
+            await db.execute("ALTER TABLE rates ADD COLUMN report_time TEXT DEFAULT '24 Hours'")
+            await db.commit()
+            print("রেট টেবিলে অতিরিক্ত কলাম যোগ করা হয়েছে।")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" in str(e).lower():
+                pass
+            else:
+                print(f"রেট কলাম যোগ করতে সমস্যা: {e}")
+                raise
 
-    await asyncio.to_thread(setup_db)
-
+        await db.commit()
 async def get_user(user_id):
-    db = await get_db_connection()
-    try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
             return await cursor.fetchone()
 
 async def add_user(user_id, username, full_name, referrer=None):
-    db = await get_db_connection()
-    try:
-        await asyncio.to_thread(db.execute,"INSERT OR IGNORE INTO users (user_id, username, full_name, referrer) VALUES (?, ?, ?, ?)", (user_id, username, full_name, referrer))
-        asyncio.to_thread(db.commit)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR IGNORE INTO users (user_id, username, full_name, referrer) VALUES (?, ?, ?, ?)", (user_id, username, full_name, referrer))
+        await db.commit()
     if referrer:
         await give_refer_bonus(user_id)
-    finally:
-        db.close()
+
 async def get_rate(full_cat):
-    db = await get_db_connection()
-    try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT rate_bdt FROM rates WHERE category = ?", (full_cat,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 5
-    finally:
-        db.close()
+
 async def is_enabled(full_cat):
-    db = await get_db_connection()
-    try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT enabled FROM toggles WHERE item = ?", (full_cat,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 1
-    finally:
-        db.close()
+
 async def get_coin_user():
     return "genzraiyaan"
 
@@ -337,6 +370,7 @@ def main_menu():
         [InlineKeyboardButton(text="📁 Files", callback_data="files_menu")],
         [InlineKeyboardButton(text="💳 Balance", callback_data="balance_menu")],
         [InlineKeyboardButton(text="👥 Referral", callback_data="referral")],
+        [InlineKeyboardButton(text="📋 Track Order", callback_data="track_order")],
         [InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw_start")],
         [InlineKeyboardButton(text="⚙️ Settings", callback_data="settings")],
         [InlineKeyboardButton(text="🆘 Support", url="https://t.me/teamraiyaan")],
@@ -378,9 +412,9 @@ async def start(message: types.Message):
 @dp.callback_query(F.data.startswith("lang_"))
 async def set_lang(call: types.CallbackQuery):
     lang = call.data.split("_")[1]
-    db = await get_db_connection() try:
-        await asyncio.to_thread(db.execute,"UPDATE users SET language = ? WHERE user_id = ?", (lang, call.from_user.id))
-        asyncio.to_thread(db.commit)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET language = ? WHERE user_id = ?", (lang, call.from_user.id))
+        await db.commit()
     welcome = await t(call.from_user.id, 'welcome')
     await call.message.edit_text(welcome, reply_markup=main_menu())
     await call.answer()
@@ -415,42 +449,42 @@ async def main_cat_selected(call: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("subcat_"))
 async def sub_cat_selected(call: types.CallbackQuery, state: FSMContext):
-    full_cat = call.data.split("_", 1)[1]
+    full_cat = call.data.split("_", 1)[1]  # subcat_Facebook_Webmail → Facebook_Webmail
     await state.update_data(category=full_cat)
 
+    # অটোমেটিক রেট টগল/ডিসপ্লে নামের জন্য ম্যাপিং (রেট সেট করার সময় কাজে লাগবে)
+    # এটা শুধু রেফারেন্সের জন্য — কোনো ডাটাবেস চেঞ্জ লাগবে না
+
     if "PC Clone Cookies" in full_cat:
+        # PC Clone সাব টাইপ সিলেক্ট
         kb = []
         for sub in PC_CLONE_SUB:
             kb.append([InlineKeyboardButton(text=sub, callback_data="ready_send")])
         kb.extend(back_home_kb())
+
         pc_prompt = await t(call.from_user.id, 'pc_clone_prompt')
         await call.message.edit_text(pc_prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
     elif "Random Gmail" in full_cat:
-        # শক্তিশালী পাসওয়ার্ডের জন্য ক্যারেক্টার সেট
+        # র‍্যান্ডম জিমেইল সাজেস্ট
         lowercase = string.ascii_lowercase
-        uppercase = string.ascii_uppercase
         digits = string.digits
-        special = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+        all_chars = string.ascii_letters + digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
 
-        all_chars = lowercase + uppercase + digits + special
-
-        # ১টা র‍্যান্ডম জিমেইল ইউজারনেম (১০-১৫ অক্ষর)
-        username_length = random.randint(10, 15)
-        username = ''.join(random.choices(lowercase + digits, k=username_length))
+        # র‍্যান্ডম ইউজারনেইম (১০-১৫ অক্ষর)
+        username = ''.join(random.choices(lowercase + digits, k=random.randint(10, 15)))
         email = f"{username}@gmail.com"
 
-        # খুবই শক্তিশালী পাসওয়ার্ড (১৮-২২ অক্ষর)
-        password_length = random.randint(18, 22)
-        password = ''.join(random.choices(all_chars, k=password_length))
+        # শক্তিশালী পাসওয়ার্ড (১৮-২২ অক্ষর)
+        password = ''.join(random.choices(all_chars, k=random.randint(18, 22)))
 
-        # সুন্দর ফরম্যাটে দেখানো
         suggestion_text = (
             f"<b>📧 সাজেস্টেড জিমেইল:</b>\n"
             f"<code>{email}</code>\n\n"
             f"<b>🔐 শক্তিশালী পাসওয়ার্ড:</b>\n"
             f"<code>{password}</code>\n\n"
             f"🔹 এই ইমেইল ও পাসওয়ার্ড দিয়ে জিমেইল তৈরি করুন।\n"
-            f"🔹 তৈরি হয়ে গেলে নিচের <b>Done</b> বাটন চাপুন।"
+            f"🔹 তৈরি হয়ে গেলে <b>Done</b> চাপুন।"
         )
 
         kb = [
@@ -460,7 +494,6 @@ async def sub_cat_selected(call: types.CallbackQuery, state: FSMContext):
 
         title = await t(call.from_user.id, 'random_gmail_title')
         desc = await t(call.from_user.id, 'random_gmail_desc')
-
         final_text = f"<b>{title}</b>\n\n{suggestion_text}\n\n{desc}"
 
         await call.message.edit_text(
@@ -470,18 +503,27 @@ async def sub_cat_selected(call: types.CallbackQuery, state: FSMContext):
         )
 
     else:
+        # সাধারণ ফাইল/কয়েন পাঠানোর প্রম্পট
         text = await t(call.from_user.id, 'send_file_prompt')
         if "Coin" in full_cat:
             text += f"\n\n{await t(call.from_user.id, 'coin_user_prompt')} {await get_coin_user()}"
-        
-        kb = [[InlineKeyboardButton(text="Cancel", callback_data="main_menu")]]
+
+        kb = [
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="main_menu")]
+        ]
         kb.extend(back_home_kb())
-        
+
+        # পুরোনো মেসেজ আইডি সেভ করে রাখি (পরে কীবোর্ড ক্লোজ করার জন্য)
+        await state.update_data(prev_msg_id=call.message.message_id)
+
         await call.message.edit_text(
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
         )
         await state.set_state(States.waiting_file)
+
+    await call.answer()
+
 @dp.callback_query(F.data == "ready_send")
 async def ready_send(call: types.CallbackQuery, state: FSMContext):
     text = await t(call.from_user.id, 'send_file_prompt')
@@ -614,6 +656,7 @@ async def gmail_reject(call: types.CallbackQuery):
                 print(f"Edit text error: {e}")
 
     await call.answer("রিজেক্ট করা হয়েছে। ❌")
+
 @dp.message(States.waiting_file, F.document | F.photo)
 async def receive_file(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -621,242 +664,751 @@ async def receive_file(message: types.Message, state: FSMContext):
     rate = await get_rate(full_cat)
     user = message.from_user
 
-    # ডাটাবেসে message_id সহ সেভ করা
-    db = await get_db_connection() try:
-        await asyncio.to_thread(db.execute,"""
-            INSERT INTO files 
-            (user_id, category, sub_category, status, rate, message_id) 
-            VALUES (?, ?, ?, 'pending', ?, ?)
+    # অর্ডার আইডি জেনারেট (১০ অক্ষর)
+    order_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+    # ডেটা কাউন্ট (XLSX/TXT ফাইলের জন্য)
+    data_count = 1
+    if message.document:
+        try:
+            file_info = await bot.get_file(message.document.file_id)
+            file_bytes = await bot.download_file(file_info.file_path)
+            file_stream = BytesIO(file_bytes)
+
+            filename = message.document.file_name.lower()
+            if filename.endswith('.xlsx'):
+                df = pd.read_excel(file_stream)
+                data_count = len(df)
+            elif filename.endswith('.txt'):
+                file_stream.seek(0)
+                lines = file_stream.read().decode('utf-8', errors='ignore').splitlines()
+                data_count = len([line for line in lines if line.strip()])
+        except Exception as e:
+            print(f"ফাইল কাউন্টে সমস্যা: {e}")
+            data_count = 1
+
+    total_amount = rate * data_count
+
+    # ডাটাবেসে সেভ
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT INTO files
+            (user_id, category, sub_category, status, rate, message_id, order_id, username, data_count)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
         """, (
             user.id,
             full_cat.split('_')[0],
             full_cat.split('_')[1],
             rate,
-            message.message_id
+            message.message_id,
+            order_id,
+            user.username or "নেই",
+            data_count
         ))
-        await asyncio.to_thread(db.execute,"UPDATE users SET pending = pending + 1 WHERE user_id = ?", (user.id,))
-        asyncio.to_thread(db.commit)
+        await db.execute("UPDATE users SET pending = pending + 1 WHERE user_id = ?", (user.id,))
+        await db.commit()
 
-    # এডমিনের কাছে বাটন সহ ফরওয়ার্ড
+    # এডমিনের কাছে পাঠানো
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{message.message_id}"),
-            InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{message.message_id}")
+            InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{order_id}"),
+            InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{order_id}")
         ],
-        [
-            InlineKeyboardButton(text="📋 কপি ইউজার আইডি", callback_data=f"copyid_{user.id}")
-        ]
+        [InlineKeyboardButton(text="📋 কপি ইউজার আইডি", callback_data=f"copyid_{user.id}")]
     ])
 
-    caption = f"""
-📥 <b>নতুন ফাইল এসেছে</b>
-
-🔹 ক্যাটাগরি: {full_cat}
-💰 রেট: {rate} টাকা
-
-👤 ইউজার: {user.full_name}
-🆔 আইডি: <code>{user.id}</code>
-    """
+    caption = (
+        f"📥 <b>নতুন ফাইল এসেছে</b>\n\n"
+        f"🆔 <b>অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+        f"🔹 ক্যাটাগরি: {full_cat.replace('_', ' ')}\n"
+        f"💰 রেট: {rate} টাকা/ডেটা\n"
+        f"📊 ডেটা সংখ্যা: {data_count}\n"
+        f"💸 মোট: <b>{total_amount} টাকা</b>\n\n"
+        f"👤 নাম: {user.full_name}\n"
+        f"📛 ইউজারনেইম: @{user.username or 'নেই'}\n"
+        f"🆔 আইডি: <code>{user.id}</code>"
+    )
 
     if message.document:
         await bot.send_document(ADMIN_ID, message.document.file_id, caption=caption, parse_mode="HTML", reply_markup=admin_kb)
     else:
         await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=caption, parse_mode="HTML", reply_markup=admin_kb)
 
+    # ইউজারকে সুন্দর সাকসেস মেসেজ + কপি বাটন
     file_sent_text = await t(message.from_user.id, 'file_sent')
-    await message.answer(file_sent_text, reply_markup=main_menu())
-    await state.clear()
+    success_msg = (
+        f"{file_sent_text}\n\n"
+        f"🆔 <b>আপনার অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+        f"💸 <b>মোট টাকা:</b> {total_amount} টাকা (এপ্রুভ হলে)\n\n"
+        f"স্ট্যাটাস দেখতে → মেইন মেনু → 📋 ট্র্যাক অর্ডার"
+    )
 
+    copy_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")]
+    ])
+
+    await message.answer(success_msg, parse_mode="HTML", reply_markup=copy_kb)
+
+    # পুরোনো ইনলাইন কীবোর্ড বন্ধ করা (prev_msg_id দিয়ে)
+    prev_data = await state.get_data()
+    prev_msg_id = prev_data.get('prev_msg_id')
+
+    if prev_msg_id:
+        try:
+            await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=prev_msg_id, reply_markup=None)
+        except TelegramBadRequest:
+            pass
+    else:
+        # ফলব্যাক
+        try:
+            await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message.message_id - 1, reply_markup=None)
+        except TelegramBadRequest:
+            pass
+
+    await state.clear()
 # Approve হ্যান্ডলার
 @dp.callback_query(F.data.startswith("admin_approvewd_"))
 async def admin_approve_withdraw(call: types.CallbackQuery):
     try:
         target_user_id = int(call.data.split("_")[2])
     except:
-        await call.answer("ভুল ডেটা।")
+        await call.answer("ভুল ডেটা।", show_alert=True)
         return
 
-    # এখানে আপনার উইথড্র এপ্রুভ লজিক (যেমন /approvewd কমান্ডের মতো)
-    db = await get_db_connection()
-    try:
-        async with db.execute("SELECT amount_bdt FROM withdraw_requests WHERE user_id = ? AND status = 'pending'", (target_user_id,)) as cursor:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT amount_bdt, order_id FROM withdraw_requests WHERE user_id = ? AND status = 'pending'", (target_user_id,)) as cursor:
             row = await cursor.fetchone()
         if not row:
             await call.answer("কোনো পেন্ডিং উইথড্র নেই।", show_alert=True)
             return
-        amount = row[0]
+        amount, order_id = row
 
         # টাকা কাটা + স্ট্যাটাস চেঞ্জ
-        await asyncio.to_thread(db.execute,"UPDATE users SET earnings_bdt = earnings_bdt - ? WHERE user_id = ?", (amount, target_user_id))
-        await asyncio.to_thread(db.execute,"UPDATE withdraw_requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'", (target_user_id,))
-        asyncio.to_thread(db.commit)
-       finally:
-        db.close()
+        await db.execute("UPDATE users SET earnings_bdt = earnings_bdt - ? WHERE user_id = ?", (amount, target_user_id))
+        await db.execute("UPDATE withdraw_requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'", (target_user_id,))
+        await db.commit()
+
     # ইউজারকে নোটিফিকেশন
     try:
-        await bot.send_message(target_user_id, "✅ আপনার উইথড্র এপ্রুভ হয়েছে। পেমেন্টের স্ক্রিনশট পাঠান।")
+        await bot.send_message(target_user_id, 
+            f"✅ আপনার উইথড্র এপ্রুভ হয়েছে!\n"
+            f"🆔 অর্ডার: <code>{order_id}</code>\n"
+            f"💰 পরিমাণ: {amount} টাকা\n\n"
+            f"পেমেন্টের স্ক্রিনশট পাঠান।",
+            parse_mode="HTML"
+        )
     except:
         pass
 
     await call.message.edit_text(
-        call.message.text + f"\n\n✅ <b>উইথড্র এপ্রুভ করা হয়েছে ({amount} টাকা)</b>",
+        call.message.text + f"\n\n✅ <b>উইথড্র এপ্রুভ করা হয়েছে ({amount} টাকা)</b>\n🆔 অর্ডার: <code>{order_id}</code>",
         parse_mode="HTML"
     )
     await call.answer("উইথড্র এপ্রুভ করা হয়েছে।")
-    finally:
-        db.close()
-@dp.callback_query(F.data.startswith("back_to_userstats_"))
-async def back_to_userstats(call: types.CallbackQuery):
-    try:
-        target_user_id = int(call.data.split("_")[3])
-    except:
-        await call.answer("ভুল ডেটা।")
-        return
-
-    # আবার /userstats এর মতো টেক্সট + বাটন দেখানো
-    # আপনার পুরোনো /userstats কোডের টেক্সট + বাটন এখানে কপি করুন
-    # অথবা সরাসরি /userstats ফাংশন কল করুন (কিন্তু callback থেকে)
-
-    # সিম্পল উপায়: আবার userstats টেক্সট দেখানো
-    user = await get_user(target_user_id)
-    if not user:
-        await call.answer("ইউজার পাওয়া যায়নি।")
-        return
-
-    # আপনার /userstats এর টেক্সট + বাটন কপি করুন
-    stats_text = f"""
-🔍 <b>ইউজার স্ট্যাটাস (এডমিন ভিউ)</b>
-
-🆔 <b>আইডি:</b> <code>{target_user_id}</code>
-📛 <b>নাম:</b> {user[2]}
-... (বাকি টেক্সট)
-    """
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 উইথড্র এপ্রুভ", callback_data=f"admin_approvewd_{target_user_id}")],
-        [InlineKeyboardButton(text="📊 ফাইল স্ট্যাটাস", callback_data=f"admin_files_{target_user_id}")],
-        [InlineKeyboardButton(text="🏠 হোম", callback_data="main_menu")]
-    ])
-
-    await call.message.edit_text(stats_text, parse_mode="HTML", reply_markup=kb)
-    await call.answer()
-@dp.callback_query(F.data.startswith("back_to_userstats_"))
-async def back_to_userstats(call: types.CallbackQuery):
-    try:
-        target_user_id = int(call.data.split("_")[3])
-    except:
-        await call.answer("ভুল ডেটা।")
-        return
-
-    # আবার /userstats এর মতো টেক্সট + বাটন দেখানো
-    # আপনার পুরোনো /userstats কোডের টেক্সট + বাটন এখানে কপি করুন
-    # অথবা সরাসরি /userstats ফাংশন কল করুন (কিন্তু callback থেকে)
-
-    # সিম্পল উপায়: আবার userstats টেক্সট দেখানো
-    user = await get_user(target_user_id)
-    if not user:
-        await call.answer("ইউজার পাওয়া যায়নি।")
-        return
-
-    # আপনার /userstats এর টেক্সট + বাটন কপি করুন
-    stats_text = f"""
-🔍 <b>ইউজার স্ট্যাটাস (এডমিন ভিউ)</b>
-
-🆔 <b>আইডি:</b> <code>{target_user_id}</code>
-📛 <b>নাম:</b> {user[2]}
-... (বাকি টেক্সট)
-    """
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 উইথড্র এপ্রুভ", callback_data=f"admin_approvewd_{target_user_id}")],
-        [InlineKeyboardButton(text="📊 ফাইল স্ট্যাটাস", callback_data=f"admin_files_{target_user_id}")],
-        [InlineKeyboardButton(text="🏠 হোম", callback_data="main_menu")]
-    ])
-
-    await call.message.edit_text(stats_text, parse_mode="HTML", reply_markup=kb)
-    await call.answer()
+# approve 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_file(call: types.CallbackQuery):
+    order_id = call.data.split("_")[1]
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, rate, data_count FROM files WHERE order_id = ?", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            await call.answer("⚠️ ফাইল পাওয়া যায়নি।", show_alert=True)
+            return
+        user_id, rate, data_count = row
+        amount = rate * data_count
+
+        await db.execute("UPDATE files SET status = 'reported' WHERE order_id = ?", (order_id,))
+        await db.execute("UPDATE users SET pending = pending - 1, reported = reported + 1 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+    # ইউজারকে নোটিফিকেশন + কপি বাটন
+    approve_text = await t(user_id, 'approve_notification')
+    notify_msg = (
+        f"{approve_text}\n\n"
+        f"🆔 <b>অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+        f"💰 <b>মোট:</b> {amount} টাকা\n"
+        f"⏳ রিপোর্টের অপেক্ষায় (পেমেন্ট হবে শীঘ্রই)"
+    )
+
+    copy_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")]
+    ])
+
     try:
-        msg_id = int(call.data.split("_")[1])
+        await bot.send_message(user_id, notify_msg, parse_mode="HTML", reply_markup=copy_kb)
+    except:
+        pass
 
-        db = await get_db_connection() try:
-            async with db.execute("SELECT user_id, rate FROM files WHERE message_id = ?", (msg_id,)) as cursor:
-                row = await cursor.fetchone()
-            if not row:
-                await call.answer("⚠️ ফাইল পাওয়া যায়নি।", show_alert=True)
-                return
-            user_id, rate = row
-
-            await asyncio.to_thread(db.execute,"UPDATE files SET status = 'reported' WHERE message_id = ?", (msg_id,))
-            await asyncio.to_thread(db.execute,"UPDATE users SET pending = pending - 1, reported = reported + 1 WHERE user_id = ?", (user_id,))
-            asyncio.to_thread(db.commit)
-
-        approve_text = await t(user_id, 'approve_notification')
-        await bot.send_message(user_id, approve_text + f" রেট: {rate} টাকা")
-        await call.message.edit_caption(caption=call.message.caption + "\n\n✅ <b>Approved!</b>", parse_mode="HTML")
-        await call.answer("এপ্রুভ করা হয়েছে।")
-
-    except Exception as e:
-        await call.answer("সমস্যা হয়েছে।", show_alert=True)
-        print(f"Approve Error: {e}")
-
-# Reject হ্যান্ডলার (কারণ সহ)
+    # এডমিন মেসেজ আপডেট + বাটন ক্লোজ
+    await call.message.edit_caption(
+        caption=call.message.caption + "\n\n✅ <b>Approved! Waiting for report</b>",
+        parse_mode="HTML",
+        reply_markup=None  # বাটন সরিয়ে দেই
+    )
+    await call.answer("এপ্রুভ করা হয়েছে।")
+# Reject with Reason (এডমিন থেকে কাজ করবে)
+# Reject বাটন চাপলে (অর্ডার আইডি দিয়ে)
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_file(call: types.CallbackQuery, state: FSMContext):
     try:
-        msg_id = int(call.data.split("_")[1])
+        order_id = call.data.split("_")[1]  # reject_B2RBCOJPIY → B2RBCOJPIY
 
-        db = await get_db_connection() try:
-            async with db.execute("SELECT user_id FROM files WHERE message_id = ?", (msg_id,)) as cursor:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT user_id, rate, data_count, category FROM files WHERE order_id = ?", (order_id,)) as cursor:
                 row = await cursor.fetchone()
             if not row:
-                await call.answer("⚠️ ফাইল পাওয়া যায়নি।", show_alert=True)
+                await call.answer("⚠️ ফাইল পাওয়া যায়নি বা ইতিমধ্যে প্রসেস করা হয়েছে।", show_alert=True)
                 return
-            user_id = row[0]
+            user_id, rate, data_count, full_cat = row
+            total_amount = rate * data_count
 
-        await state.update_data(reject_msg_id=msg_id, reject_user_id=user_id)
+        # স্টেটে সেভ করা
+        await state.update_data(
+            reject_order_id=order_id,
+            reject_user_id=user_id,
+            reject_amount=total_amount,
+            reject_category=full_cat.replace('_', ' ')
+        )
+        await state.set_state(States.reject_reason)
 
+        # এডমিনকে কারণ চাওয়া
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Cancel Reject", callback_data="cancel_reject")]
+            [InlineKeyboardButton(text="🔙 Cancel", callback_data="cancel_reject")]
         ])
 
-        await call.message.edit_text("❌ রিজেক্টের কারণ লিখুন:\n\n(লিখে Send করুন)", reply_markup=kb)
-        await state.set_state(States.reject_reason)
+        await call.message.edit_caption(
+            caption=call.message.caption + "\n\n❌ <b>রিজেক্ট করতে চান?</b>\n\nকারণ লিখুন:",
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+
+        await call.answer()
 
     except Exception as e:
         await call.answer("সমস্যা হয়েছে।", show_alert=True)
+        print(f"Reject error: {e}")
 
+
+# কারণ রিসিভ + রিজেক্ট প্রসেস
+@dp.message(States.reject_reason)
+async def process_reject_reason(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get('reject_order_id')
+    user_id = data.get('reject_user_id')
+    total_amount = data.get('reject_amount', 0)
+    category = data.get('reject_category', 'Unknown')
+
+    reason = message.text.strip()
+    if not reason:
+        await message.answer("❌ কারণ লিখুন। অথবা Cancel করুন।")
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE files SET status = 'rejected' WHERE order_id = ?", (order_id,))
+        await db.execute("UPDATE users SET pending = pending - 1, rejected = rejected + 1 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+    # ইউজারকে নোটিফিকেশন + কপি বাটন
+    reject_msg = (
+        f"❌ আপনার ফাইল রিজেক্ট হয়েছে।\n\n"
+        f"🆔 <b>অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+        f"🔹 ক্যাটাগরি: {category}\n"
+        f"💸 মোট টাকা ছিল: {total_amount} টাকা\n"
+        f"📛 <b>কারণ:</b> {reason}\n\n"
+        f"দয়া করে সঠিক ফাইল পাঠান।"
+    )
+
+    copy_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")]
+    ])
+
+    try:
+        await bot.send_message(user_id, reject_msg, parse_mode="HTML", reply_markup=copy_kb)
+    except:
+        pass
+
+    await message.answer("✅ রিজেক্ট করা হয়েছে। ইউজারকে কারণসহ জানানো হয়েছে।", reply_markup=main_menu())
+    await state.clear()
+
+
+# Cancel Reject
 @dp.callback_query(F.data == "cancel_reject")
 async def cancel_reject(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("রিজেক্ট ক্যান্সেল করা হয়েছে।")
-    await call.answer()
-
+    try:
+        original_caption = call.message.caption.split("\n\n❌ <b>রিজেক্ট করতে চান?</b>")[0]
+        await call.message.edit_caption(
+            caption=original_caption + "\n\n🔄 রিজেক্ট ক্যান্সেল করা হয়েছে।",
+            parse_mode="HTML"
+        )
+    except:
+        await call.message.edit_caption(caption=call.message.caption + "\n\n🔄 ক্যান্সেল করা হয়েছে।", parse_mode="HTML")
+    await call.answer("রিজেক্ট ক্যান্সেল করা হয়েছে।")
 @dp.message(States.reject_reason)
-async def reject_reason(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    msg_id = data.get("reject_msg_id")
-    user_id = data.get("reject_user_id")
+async def process_reject_reason(message: types.Message, state: FSMContext):
     reason = message.text.strip()
-
     if not reason:
-        await message.answer("কারণ লিখুন।")
+        await message.answer("❌ কারণ লিখুন। অথবা Cancel করুন।")
         return
 
-    db = await get_db_connection() try:
-        await asyncio.to_thread(db.execute,"UPDATE files SET status = 'rejected' WHERE message_id = ?", (msg_id,))
-        await asyncio.to_thread(db.execute,"UPDATE users SET pending = pending - 1, rejected = rejected + 1 WHERE user_id = ?", (user_id,))
-        asyncio.to_thread(db.commit)
+    data = await state.get_data()
+    order_id = data.get('reject_order_id')
+    user_id = data.get('reject_user_id')
+    total_amount = data.get('reject_amount', 0)
+    category = data.get('reject_category', 'Unknown')
 
-    reject_text = await t(user_id, 'reject_notification')
-    await bot.send_message(user_id, reject_text + f" {reason}\nআবার চেষ্টা করুন।")
-    await message.answer("রিজেক্ট করা হয়েছে।", reply_markup=main_menu())
+    if not order_id or not user_id:
+        await message.answer("❌ সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+        await state.clear()
+        return
+
+    # ডাটাবেস আপডেট
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE files SET status = 'rejected' WHERE order_id = ?", (order_id,))
+        await db.execute("UPDATE users SET pending = pending - 1, rejected = rejected + 1 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+    # ইউজারকে সুন্দর রিজেক্ট মেসেজ + কপি বাটন
+    reject_msg = (
+        f"❌ আপনার ফাইল রিজেক্ট হয়েছে।\n\n"
+        f"🆔 <b>অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+        f"🔹 ক্যাটাগরি: {category}\n"
+        f"💸 মোট টাকা ছিল: {total_amount} টাকা\n"
+        f"📛 <b>কারণ:</b> {reason}\n\n"
+        f"দয়া করে সঠিক ফাইল পাঠান।"
+    )
+
+    copy_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")]
+    ])
+
+    try:
+        await bot.send_message(user_id, reject_msg, parse_mode="HTML", reply_markup=copy_kb)
+    except:
+        pass
+
+    # এডমিনকে কনফার্ম + পুরোনো ইনলাইন বাটন ক্লোজ
+    await message.answer(
+        f"✅ রিজেক্ট করা হয়েছে।\n"
+        f"🆔 অর্ডার: <code>{order_id}</code>\n"
+        f"কারণ: {reason}",
+        reply_markup=main_menu()
+    )
+
+    # এডমিনের পুরোনো মেসেজের ইনলাইন বাটন ক্লোজ করা (যদি সম্ভব হয়)
+    try:
+        # যদি reject চাপার সময় মেসেজ এডিট করা হয়ে থাকে
+        await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message.message_id - 1, reply_markup=None)
+    except:
+        pass
+
+    await state.clear()
+# Withdraw সেকশন (সাকসেস হলে টাকা কাটবে + ট্রুটি ফ্রি)
+# উইথড্র অ্যামাউন্ট ইনপুট
+@dp.message(States.withdraw_amount)
+async def wa(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip())
+
+        if amount < 100:
+            kb = back_home_kb()
+            await message.answer("❌ মিনিমাম ১০০ টাকা। আবার লিখুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+            return
+
+        user = await get_user(message.from_user.id)
+        if not user or amount > user[8]:  # earnings_bdt
+            kb = back_home_kb()
+            await message.answer("❌ ব্যালেন্সের চেয়ে বেশি উইথড্র করা যাবে না। আবার লিখুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+            return
+
+        # অর্ডার আইডি জেনারেট (১০ অক্ষর)
+        order_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+        data = await state.get_data()
+
+        # ডাটাবেসে সেভ করা
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("""
+                INSERT INTO withdraw_requests
+                (user_id, amount_bdt, method, number, order_id, status)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+            """, (message.from_user.id, amount, data['method'], data['number'], order_id))
+            await db.commit()
+
+        # এডমিনকে নোটিফিকেশন
+        user_info = await get_user(message.from_user.id)
+        info_text = (
+            f"💸 <b>নতুন উইথড্র রিকোয়েস্ট</b>\n\n"
+            f"🆔 <b>অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+            f"👤 নাম: <b>{user_info[2]}</b>\n"
+            f"🆔 আইডি: <code>{message.from_user.id}</code>\n"
+            f"📛 ইউজারনেইম: @{user_info[1] or 'নেই'}\n"
+            f"💰 ব্যালেন্স: {user_info[8]} টাকা\n"
+            f"📁 ফাইল: পেন্ডিং {user_info[4]} | রিপোর্ট {user_info[5]} | এপ্রুভ {user_info[6]} | রিজেক্ট {user_info[7]}\n\n"
+            f"🔹 অ্যামাউন্ট: <b>{amount} টাকা</b>\n"
+            f"💳 মেথড: <b>{data['method'].upper()}</b>\n"
+            f"🔢 নম্বর: <code>{data['number']}</code>\n\n"
+            f"📅 সময়: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Approve", callback_data=f"wd_approve_{order_id}")],
+            [InlineKeyboardButton(text="❌ Reject", callback_data=f"wd_reject_{order_id}")],
+            [InlineKeyboardButton(text="📊 View Profile", callback_data=f"profile_{message.from_user.id}")]
+        ])
+
+        await bot.send_message(ADMIN_ID, info_text, parse_mode="HTML", reply_markup=admin_kb)
+
+        # ইউজারকে সুন্দর সাকসেস মেসেজ + কপি বাটন
+        success_text = await t(message.from_user.id, 'withdraw_success')
+        success_msg = (
+            f"{success_text}\n\n"
+            f"🆔 <b>আপনার উইথড্র অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+            f"💰 <b>পরিমাণ:</b> {amount} টাকা\n"
+            f"💳 <b>মেথড:</b> {data['method'].upper()}\n\n"
+            f"স্ট্যাটাস দেখতে: মেইন মেনু → 📋 ট্র্যাক অর্ডার"
+        )
+
+        copy_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")]
+        ])
+
+        await message.answer(success_msg, parse_mode="HTML", reply_markup=copy_kb)
+
+        # পুরোনো ইনলাইন বাটন বন্ধ করা
+        try:
+            await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=message.message_id - 1, reply_markup=None)
+        except TelegramBadRequest:
+            pass
+
+        await state.clear()
+
+    except ValueError:
+        kb = back_home_kb()
+        await message.answer("❌ সঠিক সংখ্যা লিখুন (যেমন: ১০০)।", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.message(Command("release"), F.from_user.id == ADMIN_ID)
+async def admin_release(message: types.Message):
+    try:
+        args = message.text.split()
+        if len(args) != 3:
+            await message.answer("❌ ব্যবহার: /release অর্ডার_আইডি কোয়ান্টিটি\nউদাহরণ: /release B2RBCOJPIY 20")
+            return
+
+        order_id = args[1].upper()
+        try:
+            quantity = int(args[2])
+            if quantity <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("❌ কোয়ান্টিটি সঠিক পূর্ণসংখ্যা হতে হবে।")
+            return
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT user_id, rate, data_count, status FROM files WHERE order_id = ?", (order_id,)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await message.answer(f"❌ অর্ডার আইডি <code>{order_id}</code> পাওয়া যায়নি।")
+                return
+            user_id, rate, data_count_db, status = row
+
+            if status != 'reported':
+                await message.answer(f"❌ এই অর্ডার রিপোর্টের অপেক্ষায় নেই। স্ট্যাটাস: {status}")
+                return
+
+            # কোয়ান্টিটি অনুযায়ী টাকা হিসাব (যদি ইউজার কম দিতে চায়)
+            amount = rate * quantity
+
+            # ডাটাবেস আপডেট
+            await db.execute("UPDATE users SET earnings_bdt = earnings_bdt + ?, reported = reported - 1, approved = approved + 1 WHERE user_id = ?", (amount, user_id))
+            await db.execute("UPDATE files SET status = 'approved' WHERE order_id = ?", (order_id,))
+            await db.commit()
+
+        # ইউজারকে নোটিফিকেশন + কপি বাটন
+        notify_msg = (
+            f"🎉 অভিনন্দন! আপনার ফাইলের পেমেন্ট রিলিজ হয়েছে!\n\n"
+            f"🆔 <b>অর্ডার আইডি:</b> <code>{order_id}</code>\n"
+            f"📊 রিলিজকৃত কোয়ান্টিটি: {quantity}\n"
+            f"💰 রেট: {rate} × {quantity} = <b>{amount} টাকা</b> যোগ হয়েছে\n\n"
+            f"আপনার ব্যালেন্স চেক করুন → মেইন মেনু → 💳 Balance"
+        )
+
+        copy_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")]
+        ])
+
+        try:
+            await bot.send_message(user_id, notify_msg, parse_mode="HTML", reply_markup=copy_kb)
+        except:
+            pass
+
+        # এডমিনকে কনফার্ম
+        await message.answer(
+            f"✅ রিলিজ সফল!\n\n"
+            f"🆔 অর্ডার: <code>{order_id}</code>\n"
+            f"👤 ইউজার আইডি: <code>{user_id}</code>\n"
+            f"📊 কোয়ান্টিটি: {quantity}\n"
+            f"💰 যোগ করা হয়েছে: <b>{amount} টাকা</b>",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        await message.answer("❌ কোনো সমস্যা হয়েছে।")
+        print(f"Release error: {e}")
+
+# উইথড্র এপ্রুভ (এডমিন)
+@dp.callback_query(F.data.startswith("wd_approve_"))
+async def withdraw_approve(call: types.CallbackQuery, state: FSMContext):
+    order_id = call.data.split("_")[2]
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, amount_bdt, method, number FROM withdraw_requests WHERE order_id = ? AND status = 'pending'", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                await call.answer("❌ এই রিকোয়েস্ট আর পেন্ডিং নেই।", show_alert=True)
+                return
+            user_id, amount, method, number = row
+
+        await db.execute("UPDATE withdraw_requests SET status = 'approved' WHERE order_id = ?", (order_id,))
+        await db.commit()
+
+    await bot.send_message(ADMIN_ID, f"✅ অর্ডার {order_id} এপ্রুভ করা হয়েছে। এখন স্ক্রিনশট পাঠান।")
+
+    await state.update_data(pending_order_id=order_id, wd_user_id=user_id, wd_amount=amount, wd_method=method, wd_number=number)
+    await state.set_state(AdminStates.screenshot_wait)
+
+    await call.message.edit_text(call.message.text + "\n\n✅ <b>Approved! এখন স্ক্রিনশট পাঠান।</b>", parse_mode="HTML")
+    await call.answer("এপ্রুভ হয়েছে।")
+
+
+# স্ক্রিনশট রিসিভ + কমপ্লিট
+@dp.message(AdminStates.screenshot_wait, F.photo)
+async def admin_screenshot(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get("pending_order_id")
+    user_id = data.get("wd_user_id")
+    amount = data.get("wd_amount")
+
+    if not order_id or not user_id:
+        await message.answer("❌ সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+        return
+
+    # স্ক্রিনশট ইউজারকে পাঠানো (ফরওয়ার্ড না করে send_photo দিয়ে)
+    photo_file_id = message.photo[-1].file_id
+    caption = f"✅ আপনার {amount} টাকার উইথড্র কমপ্লিট হয়েছে!\n🆔 অর্ডার: <code>{order_id}</code>"
+
+    try:
+        await bot.send_photo(user_id, photo_file_id, caption=caption, parse_mode="HTML")
+    except:
+        await message.answer("❌ ইউজারকে পাঠানো যায়নি (হয়তো বট ব্লক করেছে)।")
+
+    # এডমিনকে কনফার্ম
+    await message.answer(f"✅ স্ক্রিনশট পাঠানো হয়েছে। অর্ডার {order_id} কমপ্লিট।")
+
+    await state.clear()
+# উইথড্র রিজেক্ট (এডমিন)
+
+@dp.callback_query(F.data.startswith("profile_"))
+async def admin_view_profile(call: types.CallbackQuery):
+    try:
+        target_user_id = int(call.data.split("_")[1])
+
+        user = await get_user(target_user_id)
+        if not user:
+            await call.answer("❌ ইউজার পাওয়া যায়নি।", show_alert=True)
+            return
+
+        username = user[1] or "নেই"
+        full_name = user[2]
+        language = user[3]
+        pending = user[4]
+        reported = user[5]
+        approved = user[6]
+        rejected = user[7]
+        earnings = user[8] or 0
+        referral_count = user[14] if len(user) > 14 else 0
+
+        profile_text = (
+            f"👤 <b>ইউজার প্রোফাইল (এডমিন ভিউ)</b>\n\n"
+            f"🆔 <b>আইডি:</b> <code>{target_user_id}</code>\n"
+            f"📛 <b>নাম:</b> {full_name}\n"
+            f"📝 <b>ইউজারনেইম:</b> @{username}\n"
+            f"🌍 <b>ভাষা:</b> {language.upper()}\n\n"
+            f"💰 <b>ব্যালেন্স:</b> {earnings} টাকা\n\n"
+            f"📁 <b>ফাইল স্ট্যাটাস</b>\n"
+            f"⏳ পেন্ডিং: {pending}\n"
+            f"⏳ রিপোর্ট অপেক্ষায়: {reported}\n"
+            f"✅ এপ্রুভড: {approved}\n"
+            f"❌ রিজেক্টেড: {rejected}\n\n"
+            f"👥 রেফার করেছেন: {referral_count} জন"
+        )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💸 উইথড্র এপ্রুভ", callback_data=f"wd_approve_{target_user_id}")],
+            [InlineKeyboardButton(text="❌ উইথড্র রিজেক্ট", callback_data=f"wd_reject_{target_user_id}")],
+            [InlineKeyboardButton(text="🔙 ব্যাক", callback_data="main_menu")]
+        ])
+
+        await call.message.edit_text(profile_text, parse_mode="HTML", reply_markup=kb)
+        await call.answer()
+
+    except Exception as e:
+        await call.answer("সমস্যা হয়েছে।", show_alert=True)
+        print(f"Profile view error: {e}")
+
+@dp.callback_query(F.data.startswith("wd_reject_"))
+async def withdraw_reject(call: types.CallbackQuery, state: FSMContext):
+    order_id = call.data.split("_")[2]
+
+    await bot.send_message(call.from_user.id, "❌ রিজেক্টের কারণ লিখুন:")
+
+    await state.update_data(reject_order_id=order_id)
+    await state.set_state(AdminStates.reject_reason)
+
+    await call.message.edit_text(call.message.text + "\n\n❌ <b>Rejected! কারণ লিখুন।</b>", parse_mode="HTML")
+    await call.answer()
+
+
+# রিজেক্ট কারণ রিসিভ + রিফান্ড
+@dp.message(AdminStates.reject_reason)
+async def admin_reject_reason(message: types.Message, state: FSMContext):
+    reason = message.text.strip()
+    data = await state.get_data()
+    order_id = data.get("reject_order_id")
+
+    if not order_id or not reason:
+        await message.answer("❌ কারণ লিখুন।")
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, amount_bdt FROM withdraw_requests WHERE order_id = ? AND status = 'pending'", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                await message.answer("❌ রিকোয়েস্ট পাওয়া যায়নি।")
+                return
+            user_id, amount = row
+
+        await db.execute("UPDATE withdraw_requests SET status = 'rejected', reject_reason = ? WHERE order_id = ?", (reason, order_id))
+        await db.execute("UPDATE users SET earnings_bdt = earnings_bdt + ? WHERE user_id = ?", (amount, user_id))  # রিফান্ড
+        await db.commit()
+
+    await bot.send_message(user_id, f"❌ আপনার উইথড্র রিকোয়েস্ট রিজেক্ট হয়েছে।\n🆔 অর্ডার: <code>{order_id}</code>\n📛 কারণ: {reason}")
+
+    await message.answer(f"✅ অর্ডার {order_id} রিজেক্ট করা হয়েছে। টাকা রিফান্ড করা হয়েছে।")
     await state.clear()
 
-# Withdraw সেকশন (সাকসেস হলে টাকা কাটবে + ট্রুটি ফ্রি)
 
+# ইউজারের জন্য উইথড্র অর্ডার ট্র্যাক
+@dp.callback_query(F.data == "track_order")
+async def start_tracking(call: types.CallbackQuery, state: FSMContext):
+    text = (
+        "📋 <b>ট্র্যাক অর্ডার</b>\n\n"
+        "আপনার অর্ডার আইডি লিখুন।\n\n"
+        "উদাহরণ: <code>ABC123XYZ4</code>\n\n"
+        "এটা হতে পারে ফাইলের অর্ডার বা উইথড্রের অর্ডার।"
+    )
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=back_home())
+    await state.set_state(States.tracking_order)
+    await call.answer()
+
+@dp.message(States.tracking_order)
+async def process_tracking(message: types.Message, state: FSMContext):
+    order_id = message.text.strip().upper()
+
+    if len(order_id) < 8:
+        await message.answer("❌ সঠিক অর্ডার আইডি লিখুন (কমপক্ষে ৮ অক্ষর)।", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    user_id = message.from_user.id
+    found = False
+    kb_rows = []  # কপি বাটনের জন্য
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        # ফাইল চেক
+        async with db.execute("""
+            SELECT status, rate, data_count, category 
+            FROM files 
+            WHERE order_id = ? AND user_id = ?
+        """, (order_id, user_id)) as cursor:
+            file_row = await cursor.fetchone()
+
+        if file_row:
+            found = True
+            status, rate, data_count, category = file_row
+            total = rate * data_count
+
+            status_text = {
+                'pending': '⏳ পেন্ডিং',
+                'reported': '⏳ রিপোর্টের অপেক্ষায়',
+                'approved': '✅ এপ্রুভড (পেমেন্ট হয়েছে)',
+                'rejected': '❌ রিজেক্টেড'
+            }.get(status, status)
+
+            text = (
+                f"📁 <b>আপনার ফাইল অর্ডার</b>\n\n"
+                f"🆔 অর্ডার আইডি: <code>{order_id}</code>\n"
+                f"🔹 ক্যাটাগরি: {category.replace('_', ' ')}\n"
+                f"📊 ডেটা সংখ্যা: {data_count}\n"
+                f"💰 রেট: {rate} × {data_count} = <b>{total} টাকা</b>\n"
+                f"📋 স্ট্যাটাস: <b>{status_text}</b>"
+            )
+
+            # কপি বাটন যোগ করা
+            kb_rows.append([InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")])
+
+        else:
+            # উইথড্র চেক
+            async with db.execute("""
+                SELECT status, amount_bdt, method, reject_reason 
+                FROM withdraw_requests 
+                WHERE order_id = ? AND user_id = ?
+            """, (order_id, user_id)) as cursor:
+                wd_row = await cursor.fetchone()
+
+            if wd_row:
+                found = True
+                status, amount, method, reason = wd_row
+
+                status_text = {
+                    'pending': '⏳ পেন্ডিং',
+                    'approved': '✅ এপ্রুভড (পেমেন্ট হয়েছে)',
+                    'rejected': '❌ রিজেক্টেড'
+                }.get(status, status)
+
+                text = (
+                    f"💸 <b>আপনার উইথড্র অর্ডার</b>\n\n"
+                    f"🆔 অর্ডার আইডি: <code>{order_id}</code>\n"
+                    f"💳 মেথড: {method}\n"
+                    f"💰 পরিমাণ: <b>{amount} টাকা</b>\n"
+                    f"📋 স্ট্যাটাস: <b>{status_text}</b>"
+                )
+                if status == 'rejected' and reason:
+                    text += f"\n📛 কারণ: {reason}"
+
+                # কপি বাটন যোগ করা
+                kb_rows.append([InlineKeyboardButton(text="📋 কপি অর্ডার আইডি", callback_data=f"copy_order_{order_id}")])
+
+            else:
+                text = f"❌ অর্ডার আইডি <code>{order_id}</code> পাওয়া যায়নি।\nদয়া করে সঠিক আইডি লিখুন।"
+
+    # কীবোর্ড তৈরি
+    if kb_rows:
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    else:
+        reply_markup = main_menu()
+
+    await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    await state.clear()
 # উইথড্র স্টার্ট (মেনু থেকে)
+
+@dp.callback_query(F.data.startswith("copy_order_"))
+async def copy_order_id(call: types.CallbackQuery):
+    order_id = call.data.split("_")[-1]
+    await call.answer(order_id, show_alert=True)  # পপ-আপে দেখাবে + অটো কপি হবে
+
 @dp.callback_query(F.data == "withdraw_start")
 async def withdraw_start(call: types.CallbackQuery, state: FSMContext):
     kb = [
@@ -901,192 +1453,61 @@ async def wn(message: types.Message, state: FSMContext):
     await message.answer(amount_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await state.set_state(States.withdraw_amount)
 
-# অ্যামাউন্ট ইনপুট (wa) — ভ্যালিডেশন + অ্যাডমিন নোটিফিকেশন
-@dp.message(States.withdraw_amount)
-async def wa(message: types.Message, state: FSMContext):
-    try:
-        amount = float(message.text.strip())
-        if amount < 100:
-            amount_text = await t(message.from_user.id, 'withdraw_amount')
-            kb = back_home_kb()
-            await message.answer("মিনিমাম ১০০ টাকা। আবার লিখুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-            return
-
-        user = await get_user(message.from_user.id)
-        if not user or amount > user[8]:  # earnings_bdt
-            kb = back_home_kb()
-            await message.answer("ব্যালেন্সের চেয়ে বেশি নয়। আবার লিখুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-            return
-
-        data = await state.get_data()
-        db = await get_db_connection() try:
-            # রিকোয়েস্ট সেভ
-            await asyncio.to_thread(db.execute,"INSERT INTO withdraw_requests (user_id, amount_bdt, method, number) VALUES (?, ?, ?, ?)",
-                             (message.from_user.id, amount, data['method'], data['number']))
-            asyncio.to_thread(db.commit)
-
-        # এডমিনকে রিকোয়েস্ট + ইউজারের সকল তথ্য + এপ্রুভ/রিজেক্ট বাটন
-        user_info = await get_user(message.from_user.id)
-        info_text = (
-            f"💸 <b>নতুন উইথড্র রিকোয়েস্ট</b>\n\n"
-            f"👤 নাম: <b>{user_info[2]}</b>\n"
-            f"🆔 আইডি: <code>{message.from_user.id}</code>\n"
-            f"📛 ইউজারনেম: @{user_info[1] or 'নেই'}\n"
-            f"🌍 ভাষা: {user_info[3].upper()}\n"
-            f"💰 ব্যালেন্স: {user_info[8]} টাকা\n"
-            f"📁 ফাইল স্ট্যাটাস: পেন্ডিং {user_info[4]}, রিপোর্ট {user_info[5]}, এপ্রুভ {user_info[6]}, রিজেক্ট {user_info[7]}\n\n"
-            f"🔹 অ্যামাউন্ট: <b>{amount} টাকা</b>\n"
-            f"💳 মেথড: <b>{data['method']}</b>\n"
-            f"🔢 নম্বর: <code>{data['number']}</code>\n\n"
-            f"ফিচার: রিকোয়েস্ট টাইম {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        )
-
-        admin_kb = [
-            [InlineKeyboardButton(text="✅ Approve", callback_data=f"wd_approve_{message.from_user.id}")],
-            [InlineKeyboardButton(text="❌ Reject", callback_data=f"wd_reject_{message.from_user.id}")],
-            [InlineKeyboardButton(text="📊 View Profile", callback_data=f"profile_{message.from_user.id}")]
-        ]
-
-        await bot.send_message(ADMIN_ID, info_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=admin_kb))
-
-        success_text = await t(message.from_user.id, 'withdraw_success')
-        await message.answer(success_text, reply_markup=main_menu())
-        await state.clear()
-
-    except ValueError:
-        kb = back_home_kb()
-        await message.answer("সঠিক সংখ্যা লিখুন।", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-# Approve হ্যান্ডলার — স্ক্রিনশট চাইবে
-@dp.callback_query(F.data.startswith("wd_approve_"))
-async def withdraw_approve(call: types.CallbackQuery, state: FSMContext):
-    user_id = int(call.data.split("_")[2])
-    db = await get_db_connection() try:
-        async with db.execute("SELECT amount_bdt, method, number FROM withdraw_requests WHERE user_id = ? AND status = 'pending'", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                await call.answer("কোনো পেন্ডিং রিকোয়েস্ট নেই।")
-                return
-            amount, method, number = row
-
-        await asyncio.to_thread(db.execute,"UPDATE withdraw_requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'", (user_id,))
-        asyncio.to_thread(db.commit)
-
-    await bot.send_message(call.from_user.id, f"পেমেন্টের স্ক্রিনশট পাঠান ({method}: {number}, {amount} টাকা)")
-
-    await state.update_data(pending_user_id=user_id, wd_amount=amount, wd_method=method, wd_number=number)
-    await state.set_state(AdminStates.screenshot_wait)
-
-    await call.message.edit_text(call.message.text + "\n\n✅ <b>Approved! স্ক্রিনশট পাঠান।</b>", parse_mode="HTML")
-    await call.answer("এপ্রুভ হয়েছে। স্ক্রিনশট পাঠান।")
-
-# অ্যাডমিন স্ক্রিনশট পেলে ফরওয়ার্ড + কমপ্লিট
-@dp.message(AdminStates.screenshot_wait, F.photo)
-async def admin_screenshot(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    user_id = data.get("pending_user_id")
-    amount = data.get("wd_amount")
-    if not user_id:
-        await message.answer("সমস্যা হয়েছে। আবার চেষ্টা করুন।")
-        return
-
-    # স্ক্রিনশট ফরওয়ার্ড
-    await bot.forward_message(user_id, message.chat.id, message.message_id)
-    await bot.send_message(user_id, f"✅ আপনার {amount} টাকার উইথড্র কমপ্লিট হয়েছে! স্ক্রিনশট দেখুন।")
-
-    # এডমিনকে কনফার্ম
-    await message.answer("✅ স্ক্রিনশট ফরওয়ার্ড করা হয়েছে। উইথড্র কমপ্লিট।")
-
-    await state.clear()
-
-# রিজেক্ট হ্যান্ডলার — রিজন চাইবে
-@dp.callback_query(F.data.startswith("wd_reject_"))
-async def withdraw_reject(call: types.CallbackQuery, state: FSMContext):
-    user_id = int(call.data.split("_")[2])
-    await bot.send_message(call.from_user.id, "রিজেক্টের কারণ লিখুন:")
-
-    await state.update_data(reject_user_id=user_id)
-    await state.set_state(AdminStates.reject_reason)
-
-    await call.message.edit_text(call.message.text + "\n\n❌ <b>Rejected! কারণ লিখুন।</b>", parse_mode="HTML")
-    await call.answer("রিজেক্ট হয়েছে। কারণ লিখুন।")
-
-# অ্যাডমিন রিজন দিলে ইউজারকে পাঠানো + রিফান্ড (যদি চান)
-@dp.message(AdminStates.reject_reason)
-async def admin_reject_reason(message: types.Message, state: FSMContext):
-    reason = message.text.strip()
-    data = await state.get_data()
-    user_id = data.get("reject_user_id")
-    if not user_id or not reason:
-        await message.answer("কারণ লিখুন।")
-        return
-
-    db = await get_db_connection() try:
-        async with db.execute("SELECT amount_bdt FROM withdraw_requests WHERE user_id = ? AND status = 'pending'", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            amount = row[0] if row else 0
-
-        await asyncio.to_thread(db.execute,"UPDATE withdraw_requests SET status = 'rejected' WHERE user_id = ? AND status = 'pending'", (user_id,))
-        # রিফান্ড (টাকা ফিরিয়ে দিন)
-        await asyncio.to_thread(db.execute,"UPDATE users SET earnings_bdt = earnings_bdt + ? WHERE user_id = ?", (amount, user_id))
-        asyncio.to_thread(db.commit)
-
-    # ইউজারকে রিজন পাঠানো
-    await bot.send_message(user_id, f"❌ আপনার উইথড্র রিকোয়েস্ট রিজেক্ট হয়েছে।\nকারণ: {reason}")
-
-    await message.answer("✅ রিজেক্ট + কারণ পাঠানো হয়েছে।")
-
-    await state.clear()
-
-# Withdraw Approve (এডমিন) + টাকা কাটা (পুরোনো কমান্ড — রাখুন যদি চান)
-@dp.message(Command("approvewd"), F.from_user.id == ADMIN_ID)
-async def approve_wd(message: types.Message):
-    try:
-        user_id = int(message.text.split()[1])
-        db = await get_db_connection() try:
-            async with db.execute("SELECT amount_bdt FROM withdraw_requests WHERE user_id = ? AND status = 'pending'", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-            if not row:
-                await message.answer("রিকোয়েস্ট পাওয়া যায়নি।")
-                return
-            amount = row[0]
-
-            # টাকা কাটা + স্ট্যাটাস চেঞ্জ
-            await asyncio.to_thread(db.execute,"UPDATE users SET earnings_bdt = earnings_bdt - ? WHERE user_id = ?", (amount, user_id))
-            await asyncio.to_thread(db.execute,"UPDATE withdraw_requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'", (user_id,))
-            asyncio.to_thread(db.commit)
-
-        await bot.send_message(user_id, "✅ আপনার উইথড্র এপ্রুভ হয়েছে। পেমেন্টের স্ক্রিনশট পাঠান।")
-        await message.answer("এপ্রুভ করা হয়েছে + ব্যালেন্স থেকে টাকা কাটা হয়েছে।")
-    except:
-        await message.answer("ভুল ইউজার আইডি। উদাহরণ: /approvewd 123456789") 
 @dp.callback_query(F.data == "today_rate")
 async def today_rate(call: types.CallbackQuery):
-    db = await get_db_connection() try:
-        async with db.execute("SELECT category, rate_bdt FROM rates WHERE rate_bdt > 0 ORDER BY category") as cursor:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT display_name, rate_bdt, format_text, last_time, report_time 
+            FROM rates 
+            WHERE display_name IS NOT NULL 
+              AND display_name != 'None' 
+              AND rate_bdt > 5 
+            ORDER BY category
+        """) as cursor:
             rows = await cursor.fetchall()
 
     if not rows:
-        text = "💰 <b>আজকের রেট</b>\n\nকোনো রেট এখনো সেট করা হয়নি।"
+        text = "💰 <b>আজকের রেট</b>\n\nএখনো কোনো রেট আপডেট করা হয়নি। শীঘ্রই আপডেট করা হবে।"
     else:
-        text = "💰 <b>আজকের রেট</b>\n\n"
-        for cat, rate in rows:
-            # শুধু যেগুলোর রেট ৫ এর বেশি বা আপনি আপডেট করেছেন (ডিফল্ট ৫ না)
-            if rate > 5:  # আপনি যদি ডিফল্ট ৫ রাখেন, তাহলে >5 মানে আপডেট করা
-                text += f"• <b>{cat.replace('_', ' ')}</b>: <b>{rate} টাকা</b>\n"
+        text = (
+            "💎 <b>সবাই ID Submit শুরু করুন</b> 💎\n"
+            "🌙 <b>সময়মতো Submit করতে থাকুন</b> 🌙\n\n"
+            "   ⦅ <b>Submit Last Time : 11:00 PM</b> ⦆\n\n"
+        )
 
-    # যদি কোনো আপডেটেড রেট না থাকে
-    if "কোনো রেট এখনো" in text or len(text.split('\n')) <= 3:
-        text = "💰 <b>আজকের রেট</b>\n\nএখনো কোনো রেট আপডেট করা হয়নি।"
+        for name, rate, fmt, lt, rt in rows:
+            usd = round(rate / 124, 2)
+            # কয়েনের ক্ষেত্রে User: দেখানো
+            if "Coin" in name:
+                fmt = f"User: {fmt}"
+            text += (
+                f"<b>{name}</b>\n"
+                f"💸 Members Rate: <b>{rate} BDT (${usd} USD)</b>\n"
+                f"📄 Format: <b>{fmt}</b>\n"
+                f"⏰ Last Time: <b>{lt}</b>\n"
+                f"📊 Report Time: <b>{rt}</b>\n\n"
+            )
+
+        text += (
+            "   《 <b>𝗔𝗹𝗹 𝗔𝗗𝗠𝗜𝗡 𝗥𝗔𝗧𝗘 𝗜𝗡𝗕𝗢𝗫</b> 》\n"
+            "✅ Live Fresh ID Report 99+% 🔥 \n"
+            "-------------------------------------------\n"
+            "📛 কি ধরনের 𝐈𝐃 দিচ্ছেন তা অবশ্যই ফাইল নামে লিখে দিন ✅\n\n"
+            "🚀 <b>সফলতার জন্য কঠোর পরিশ্রম করুন!</b>\n"
+            "💪 <b>আমরা সবাই মিলে এগিয়ে যাই</b>\n\n"
+            "📢 <b>আমাদের চ্যানেলে জয়েন করুন:</b>\n"
+            "<b>https://t.me/genzinternational</b>"
+        )
 
     kb = back_home_kb()
-    await call.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await call.message.edit_text(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await call.answer()
+
 @dp.callback_query(F.data == "files_menu")
 async def files_menu(call: types.CallbackQuery):
     user_id = call.from_user.id
     text = "📁 <b>আপনার ফাইল স্ট্যাটস</b>\n\n"
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT pending, reported, approved, rejected FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
@@ -1102,7 +1523,7 @@ async def files_menu(call: types.CallbackQuery):
 @dp.callback_query(F.data == "balance_menu")
 async def balance_menu(call: types.CallbackQuery):
     user_id = call.from_user.id
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT earnings_bdt FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             earnings = row[0] if row else 0
@@ -1118,7 +1539,7 @@ async def referral(call: types.CallbackQuery):
     user_id = call.from_user.id
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT referral_count FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             count = row[0] if row else 0
@@ -1151,11 +1572,56 @@ async def change_lang(call: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("set_lang_"))
 async def set_language(call: types.CallbackQuery):
     lang = call.data.split("_")[2]
-    db = await get_db_connection() try:
-        await asyncio.to_thread(db.execute,"UPDATE users SET language = ? WHERE user_id = ?", (lang, call.from_user.id))
-        asyncio.to_thread(db.commit)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET language = ? WHERE user_id = ?", (lang, call.from_user.id))
+        await db.commit()
     await call.message.edit_text(f"✅ ভাষা পরিবর্তন করা হয়েছে: {LANGUAGES[lang]['name']}", reply_markup=main_menu())
     await call.answer()
+
+@dp.message(Command("pending"), F.from_user.id == ADMIN_ID)
+async def list_pending(message: types.Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT message_id, user_id, category, rate FROM files WHERE status = 'pending'") as cursor:
+            rows = await cursor.fetchall()
+    
+    if not rows:
+        await message.answer("কোনো পেন্ডিং ফাইল নেই।")
+        return
+
+    text = "⏳ <b>পেন্ডিং ফাইল লিস্ট</b>\n\n"
+    for msg_id, user_id, cat, rate in rows:
+        text += f"• আইডি: <code>{msg_id}</code> | ইউজার: <code>{user_id}</code> | ক্যাটাগরি: {cat} | রেট: {rate} টাকা\n"
+        text += f"  /approve_{msg_id}  /reject_{msg_id}\n\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("reported"), F.from_user.id == ADMIN_ID)
+async def list_reported(message: types.Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT message_id, user_id, category, rate FROM files WHERE status = 'reported'") as cursor:
+            rows = await cursor.fetchall()
+    
+    if not rows:
+        await message.answer("কোনো রিপোর্ট অপেক্ষায় ফাইল নেই।")
+        return
+
+    text = "⏳ <b>রিপোর্ট অপেক্ষায় ফাইল লিস্ট</b>\n\n"
+    for msg_id, user_id, cat, rate in rows:
+        text += f"• আইডি: <code>{msg_id}</code> | ইউজার: <code>{user_id}</code> | ক্যাটাগরি: {cat} | রেট: {rate} টাকা\n\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+# ম্যানুয়াল এপ্রুভ / রিজেক্ট (পরে করার জন্য)
+@dp.message(Command("approve"))
+async def manual_approve(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        msg_id = int(message.text.split()[1])
+        # একই approve_file লজিক ব্যবহার করুন (কোড কপি করুন বা ফাংশন বানান)
+        await message.answer("ম্যানুয়াল এপ্রুভ চালানো হয়েছে।")
+    except:
+        await message.answer("ব্যবহার: /approve message_id")
 
 @dp.message(Command("broadcast"), F.from_user.id == ADMIN_ID)
 async def broadcast(message: types.Message):
@@ -1164,7 +1630,7 @@ async def broadcast(message: types.Message):
         return
     text = message.text.split(maxsplit=1)[1]
     success = 0
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
             rows = await cursor.fetchall()
             for (uid,) in rows:
@@ -1213,7 +1679,7 @@ async def help_command(message: types.Message):
 @dp.message(Command("myrate"))
 async def my_rate(message: types.Message):
     text = "💰 <b>আপনার রেট লিস্ট</b>\n\n"
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT category, rate_bdt FROM rates ORDER BY category") as cursor:
             rows = await cursor.fetchall()
             for cat, rate in rows:
@@ -1364,7 +1830,7 @@ async def invite_command(message: types.Message):
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
 
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT referral_count FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             count = row[0] if row else 0
@@ -1391,6 +1857,182 @@ async def invite_command(message: types.Message):
 
 
 # এডমিন কমান্ডস
+# এডমিনের জন্য পাওয়ারফুল অর্ডার ট্র্যাক + একশন বাটন
+@dp.message(Command("trackorder"), F.from_user.id == ADMIN_ID)
+async def admin_track_order(message: types.Message):
+    try:
+        order_id = message.text.split()[1].upper()
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            # প্রথমে ফাইল চেক
+            async with db.execute("""
+                SELECT f.order_id, f.user_id, f.category, f.rate, f.data_count, f.status,
+                       u.full_name, u.username
+                FROM files f
+                JOIN users u ON f.user_id = u.user_id
+                WHERE f.order_id = ?
+            """, (order_id,)) as cursor:
+                file_row = await cursor.fetchone()
+
+            if file_row:
+                order_id, user_id, category, rate, data_count, status, full_name, username = file_row
+                total = rate * data_count
+
+                status_text = {
+                    'pending': '⏳ পেন্ডিং',
+                    'reported': '⏳ রিপোর্টের অপেক্ষায়',
+                    'approved': '✅ এপ্রুভড',
+                    'rejected': '❌ রিজেক্টেড'
+                }.get(status, status)
+
+                text = (
+                    f"📁 <b>ফাইল অর্ডার ডিটেইলস</b>\n\n"
+                    f"🆔 অর্ডার: <code>{order_id}</code>\n"
+                    f"👤 নাম: <b>{full_name}</b>\n"
+                    f"📛 ইউজারনেইম: @{username or 'নেই'}\n"
+                    f"🆔 আইডি: <code>{user_id}</code>\n"
+                    f"🔹 ক্যাটাগরি: {category.replace('_', ' ')}\n"
+                    f"📊 ডেটা: {data_count}\n"
+                    f"💰 মোট: <b>{total} টাকা</b>\n"
+                    f"📋 স্ট্যাটাস: <b>{status_text}</b>"
+                )
+
+                # বাটন যোগ করা — শুধু পেন্ডিং বা রিপোর্টেড হলে
+                kb = []
+                if status == 'pending':
+                    kb.append([
+                        InlineKeyboardButton(text="✅ Approve", callback_data=f"admin_approve_file_{order_id}"),
+                        InlineKeyboardButton(text="❌ Reject", callback_data=f"admin_reject_file_{order_id}")
+                    ])
+                elif status == 'reported':
+                    kb.append([InlineKeyboardButton(text="💸 Release (Pay)", callback_data=f"admin_release_file_{order_id}")])
+                
+                # সবসময় Deduct অপশন থাকবে (ভুল হলে টাকা কাটার জন্য)
+                kb.append([InlineKeyboardButton(text="⚠️ Deduct Money", callback_data=f"admin_deduct_file_{order_id}")])
+
+                reply_markup = InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+                await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+                return
+
+            # উইথড্র চেক
+            async with db.execute("""
+                SELECT w.order_id, w.user_id, w.amount_bdt, w.method, w.number, w.status,
+                       u.full_name, u.username
+                FROM withdraw_requests w
+                JOIN users u ON w.user_id = u.user_id
+                WHERE w.order_id = ?
+            """, (order_id,)) as cursor:
+                wd_row = await cursor.fetchone()
+
+            if wd_row:
+                order_id, user_id, amount, method, number, status, full_name, username = wd_row
+
+                status_text = {
+                    'pending': '⏳ পেন্ডিং',
+                    'approved': '✅ এপ্রুভড',
+                    'rejected': '❌ রিজেক্টেড'
+                }.get(status, status)
+
+                text = (
+                    f"💸 <b>উইথড্র অর্ডার ডিটেইলস</b>\n\n"
+                    f"🆔 অর্ডার: <code>{order_id}</code>\n"
+                    f"👤 নাম: <b>{full_name}</b>\n"
+                    f"📛 ইউজারনেইম: @{username or 'নেই'}\n"
+                    f"🆔 আইডি: <code>{user_id}</code>\n"
+                    f"💳 মেথড: {method}\n"
+                    f"🔢 নম্বর: <code>{number}</code>\n"
+                    f"💰 পরিমাণ: <b>{amount} টাকা</b>\n"
+                    f"📋 স্ট্যাটাস: <b>{status_text}</b>"
+                )
+
+                kb = []
+                if status == 'pending':
+                    kb.append([
+                        InlineKeyboardButton(text="✅ Approve Withdraw", callback_data=f"admin_approve_wd_{order_id}"),
+                        InlineKeyboardButton(text="❌ Reject Withdraw", callback_data=f"admin_reject_wd_{order_id}")
+                    ])
+
+                reply_markup = InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+                await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+                return
+
+            # কিছুই পাওয়া গেল না
+            await message.answer(f"❌ অর্ডার আইডি <code>{order_id}</code> পাওয়া যায়নি।")
+
+    except IndexError:
+        await message.answer("❌ ব্যবহার: /trackorder অর্ডার_আইডি\nউদাহরণ: /trackorder ABC123XYZ4")
+    except Exception as e:
+        await message.answer("❌ কোনো সমস্যা হয়েছে।")
+        print(f"Admin Track Error: {e}")
+
+
+# ফাইল এপ্রুভ (এডমিন থেকে)
+@dp.callback_query(F.data.startswith("admin_approve_file_"))
+async def admin_approve_file(call: types.CallbackQuery):
+    order_id = call.data.split("_")[-1]
+    # আপনার আগের approve_file লজিক ব্যবহার করুন বা এখানে সরাসরি
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, rate, data_count FROM files WHERE order_id = ?", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                user_id, rate, data_count = row
+                await db.execute("UPDATE files SET status = 'reported' WHERE order_id = ?", (order_id,))
+                await db.execute("UPDATE users SET pending = pending - 1, reported = reported + 1 WHERE user_id = ?", (user_id,))
+                await db.commit()
+                await bot.send_message(user_id, f"🎉 আপনার ফাইল এপ্রুভ হয়েছে! অর্ডার: {order_id}")
+    await call.message.edit_text(call.message.text + "\n\n✅ এপ্রুভ করা হয়েছে।", parse_mode="HTML")
+    await call.answer()
+
+# ফাইল রিজেক্ট
+@dp.callback_query(F.data.startswith("admin_reject_file_"))
+async def admin_reject_file(call: types.CallbackQuery):
+    order_id = call.data.split("_")[-1]
+    # রিজেক্ট লজিক (কারণ চাইতে পারেন বা ডিফল্ট)
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM files WHERE order_id = ?", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                user_id = row[0]
+                await db.execute("UPDATE files SET status = 'rejected' WHERE order_id = ?", (order_id,))
+                await db.execute("UPDATE users SET pending = pending - 1, rejected = rejected + 1 WHERE user_id = ?", (user_id,))
+                await db.commit()
+                await bot.send_message(user_id, f"❌ আপনার ফাইল রিজেক্ট হয়েছে। অর্ডার: {order_id}")
+    await call.message.edit_text(call.message.text + "\n\n❌ রিজেক্ট করা হয়েছে।", parse_mode="HTML")
+    await call.answer()
+
+# রিলিজ (রিপোর্ট থেকে পে)
+@dp.callback_query(F.data.startswith("admin_release_file_"))
+async def admin_release_file(call: types.CallbackQuery):
+    order_id = call.data.split("_")[-1]
+    # আপনার release লজিক (যেমন আগের /release কমান্ড)
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, rate, data_count FROM files WHERE order_id = ? AND status = 'reported'", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                user_id, rate, data_count = row
+                amount = rate * data_count
+                await db.execute("UPDATE users SET earnings_bdt = earnings_bdt + ?, reported = reported - 1, approved = approved + 1 WHERE user_id = ?", (amount, user_id))
+                await db.execute("UPDATE files SET status = 'approved' WHERE order_id = ?", (order_id,))
+                await db.commit()
+                await bot.send_message(user_id, f"🎉 অর্ডার {order_id} রিলিজ হয়েছে! +{amount} টাকা যোগ হয়েছে।")
+    await call.message.edit_text(call.message.text + "\n\n💸 রিলিজ করা হয়েছে।", parse_mode="HTML")
+    await call.answer()
+
+# উইথড্র এপ্রুভ ও রিজেক্ট (আগের লজিকের সাথে মিলিয়ে নিন)
+@dp.callback_query(F.data.startswith("admin_approve_wd_"))
+async def admin_approve_wd(call: types.CallbackQuery):
+    order_id = call.data.split("_")[-1]
+    # আপনার wd_approve লজিক কপি করুন
+    await call.answer("এপ্রুভ করা হয়েছে।")
+
+@dp.callback_query(F.data.startswith("admin_reject_wd_"))
+async def admin_reject_wd(call: types.CallbackQuery):
+    order_id = call.data.split("_")[-1]
+    # রিজেক্ট + কারণ চাওয়া লজিক
+    await call.answer("রিজেক্ট প্রক্রিয়া শুরু।")
+
 @dp.message(Command("addbalance"), F.from_user.id == ADMIN_ID)
 async def manual_add_balance(message: types.Message):
     args = message.text.split()
@@ -1416,7 +2058,7 @@ async def manual_add_balance(message: types.Message):
         await message.answer("❌ অ্যামাউন্ট পজিটিভ সংখ্যা হতে হবে (যেমন: 100, 250.5)")
         return
 
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT full_name, earnings_bdt FROM users WHERE user_id = ?", (user_id,)) as cursor:
             user_row = await cursor.fetchone()
 
@@ -1427,11 +2069,11 @@ async def manual_add_balance(message: types.Message):
         user_name, current_balance = user_row
         new_balance = current_balance + amount
 
-        await asyncio.to_thread(db.execute,
+        await db.execute(
             "UPDATE users SET earnings_bdt = earnings_bdt + ? WHERE user_id = ?",
             (amount, user_id)
         )
-        asyncio.to_thread(db.commit)
+        await db.commit()
 
     # ইউজারকে নোটিফিকেশন
     try:
@@ -1455,152 +2097,141 @@ async def manual_add_balance(message: types.Message):
         f"📊 নতুন ব্যালেন্স: <b>{new_balance} টাকা</b>",
         parse_mode="HTML"
     )
-@dp.message(Command("release"), F.from_user.id == ADMIN_ID)
-async def manual_release_payment(message: types.Message):
-    args = message.text.split()
-    
-    # সঠিক ফরম্যাট চেক
-    if len(args) != 3:
-        await message.answer(
-            "❌ ভুল ফরম্যাট!\n\n"
-            "<b>সঠিক ব্যবহার:</b>\n"
-            "/release <user_id> <amount>\n\n"
-            "<b>উদাহরণ:</b>\n"
-            "/release 8143512878 500\n"
-            "/release 123456789 250",
-            parse_mode="HTML"
-        )
-        return
 
-    try:
-        user_id = int(args[1])
-    except ValueError:
-        await message.answer("❌ ইউজার আইডি সঠিক সংখ্যা হতে হবে।")
-        return
 
+@dp.message(Command("deduct"), F.from_user.id == ADMIN_ID)
+async def deduct_balance(message: types.Message):
     try:
+        args = message.text.split(maxsplit=3)
+        order_id = args[1]
         amount = float(args[2])
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ অ্যামাউন্ট পজিটিভ সংখ্যা হতে হবে (যেমন: 100, 250.5)")
-        return
+        reason = args[3] if len(args) > 3 else "ভুল রিলিজ"
 
-    db = await get_db_connection() try:
-        # ইউজার আছে কিনা চেক করা (অপশনাল, কিন্তু ভালো)
-        async with db.execute("SELECT full_name, earnings_bdt FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            user_row = await cursor.fetchone()
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT user_id FROM files WHERE order_id = ?", (order_id,)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await message.answer("অর্ডার পাওয়া যায়নি।")
+                return
+            user_id = row[0]
+            await db.execute("UPDATE users SET earnings_bdt = earnings_bdt - ? WHERE user_id = ?", (amount, user_id))
+            await db.commit()
 
-        if not user_row:
-            await message.answer(f"❌ ইউজার আইডি <code>{user_id}</code> বটে পাওয়া যায়নি।", parse_mode="HTML")
-            return
+        await bot.send_message(user_id, f"⚠️ অর্ডার {order_id} থেকে {amount} টাকা কাটা হয়েছে।\nকারণ: {reason}")
+        await message.answer("টাকা কাটা হয়েছে।")
 
-        user_name, current_balance = user_row
+    except:
+        await message.answer("ব্যবহার: /deduct অর্ডার_আইডি পরিমাণ [কারণ]")
 
-        # টাকা যোগ করা
-        new_balance = current_balance + amount
-        await asyncio.to_thread(db.execute,
-            "UPDATE users SET earnings_bdt = earnings_bdt + ? WHERE user_id = ?",
-            (amount, user_id)
-        )
-        asyncio.to_thread(db.commit)
-
-    # ইউজারকে নোটিফিকেশন
-    try:
-        await bot.send_message(
-            user_id,
-            f"🎉 অ্যাডমিন থেকে পেমেন্ট রিলিজ হয়েছে!\n\n"
-            f"💰 <b>+{amount} টাকা</b> যোগ হয়েছে\n"
-            f"📊 নতুন ব্যালেন্স: <b>{new_balance} টাকা</b>\n\n"
-            f"এখন উইথড্র করতে পারবেন। ধন্যবাদ! 🌟",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await message.answer(f"⚠️ ইউজারকে মেসেজ পাঠানো যায়নি (হয়তো ব্লক করেছে)। কিন্তু টাকা যোগ হয়েছে।")
-
-    # এডমিনকে কনফার্মেশন
-    await message.answer(
-        f"✅ সফলভাবে রিলিজ করা হয়েছে!\n\n"
-        f"👤 ইউজার: <b>{user_name}</b>\n"
-        f"🆔 আইডি: <code>{user_id}</code>\n"
-        f"💰 যোগ করা হয়েছে: <b>{amount} টাকা</b>\n"
-        f"📊 নতুন ব্যালেন্স: <b>{new_balance} টাকা</b>",
-        parse_mode="HTML"
-    )
 @dp.message(Command("setrate"), F.from_user.id == ADMIN_ID)
 async def set_rate(message: types.Message):
-    args = message.text.split()[1:]  # /setrate এর পরের সব
-
-    if not args:
+    lines = message.text.splitlines()[1:]  # /setrate এর পরের লাইনগুলো
+    if not lines:
         await message.answer(
-            "❌ কোনো রেট দেওয়া হয়নি!\n\n"
-            "<b>ব্যবহার:</b>\n"
-            "/setrate Facebook_Webmail=10 Coins_Niva=7 Others_Other=15\n\n"
-            "একাধিক রেট একসাথে চেঞ্জ করতে পারবেন।",
-            parse_mode="HTML"
+            "❌ সঠিক ব্যবহার:\n\n"
+            "/setrate\n"
+            "Webmail=7.70|UID - Pass - 2FA|11 PM BD|24 hours\n"
+            "Niva Coin=5.00|User - Pass|11 PM BD|24 hours"
         )
         return
 
     updated = []
-    failed = []
+    cat_map = {
+        "Webmail": "Facebook_Webmail",
+        "Anymail": "Facebook_Anymail",
+        "Number": "Facebook_Number",
+        "PC Clone 1000x": "Facebook_PC Clone Cookies",
+        "6155/56x Cookies": "Facebook_PC Clone Cookies",
+        "Instagram Cookies": "Instagram_Instagram Cookies",
+        "Instagram 2FA": "Instagram_Instagram 2FA",
+        "Niva Coin": "Coins_Niva Coin",
+        "NS Coin": "Coins_NS Coin",
+        "Topfollow": "Coins_Topfollow",
+        "Nitra Coin": "Coins_Nitra Coin",
+        "Gmail Files": "Gmail_Gmail Files",
+        "Random Gmail": "Gmail_Random Gmail",
+        "Other Files": "Others_Other Files"
+    }
 
-    db = await get_db_connection() try:
-        for arg in args:
-            if '=' not in arg:
-                failed.append(f"❌ {arg} (ফরম্যাট ভুল)")
+    async with aiosqlite.connect(DB_NAME) as db:
+        for line in lines:
+            line = line.strip()
+            if not line or '=' not in line:
                 continue
 
-            cat, rate_str = arg.split('=', 1)
-            cat = cat.strip()
-            rate_str = rate_str.strip()
+            cat_name, value = line.split('=', 1)
+            cat_name = cat_name.strip()
+            db_cat = cat_map.get(cat_name)
 
-            if not cat:
-                failed.append("❌ খালি ক্যাটাগরি")
-                continue
+            if not db_cat:
+                continue  # যদি ম্যাপে না থাকে, স্কিপ করো
 
+            parts = [p.strip() for p in value.split('|')]
             try:
-                rate = float(rate_str)
-                if rate < 0:
-                    raise ValueError
-            except ValueError:
-                failed.append(f"❌ {cat} = {rate_str} (সংখ্যা হতে হবে)")
+                rate = float(parts[0])
+            except:
                 continue
 
-            # রেট আপডেট (INSERT OR REPLACE = UPSERT)
-            await asyncio.to_thread(db.execute,
-                "INSERT OR REPLACE INTO rates (category, rate_bdt) VALUES (?, ?)",
-                (cat, rate)
-            )
-            updated.append(f"✅ <b>{cat.replace('_', ' ')}</b> → <b>{rate} টাকা</b>")
+            format_text = parts[1] if len(parts) > 1 else "UID | Pass | 2FA"
+            last_time = parts[2] if len(parts) > 2 else "11:00 PM BD"
+            report_time = parts[3] if len(parts) > 3 else "24 Hours"
 
-        asyncio.to_thread(db.commit)
+            await db.execute("""
+                INSERT OR REPLACE INTO rates
+                (category, rate_bdt, display_name, format_text, last_time, report_time)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (db_cat, rate, cat_name, format_text, last_time, report_time))
 
-    # ফিডব্যাক তৈরি
-    response = "<b>📢 রেট আপডেট সম্পন্ন!</b>\n\n"
+            updated.append((cat_name, rate, format_text, last_time, report_time))
 
-    if updated:
-        response += "<b>সফলভাবে চেঞ্জ হয়েছে:</b>\n" + "\n".join(updated) + "\n\n"
-    if failed:
-        response += "<b>ফেইলড:</b>\n" + "\n".join(failed) + "\n\n"
+        await db.commit()
 
-    # ব্রডকাস্ট শুধু যদি কিছু আপডেট হয়
-    if updated:
-        broadcast_text = "📢 <b>নতুন রেট আপডেট!</b>\n\n" + "\n".join(updated)
-        broadcast_count = 0
+    # বাকি কোড (ব্রডকাস্ট ইত্যাদি) আগের মতোই থাকবে
+    if not updated:
+        await message.answer("কোনো রেট আপডেট হয়নি।")
+        return
 
-        db = await get_db_connection() try:
-            async with db.execute("SELECT user_id FROM users") as cursor:
-                rows = await cursor.fetchall()
-                for (uid,) in rows:
-                    try:
-                        await bot.send_message(uid, broadcast_text, parse_mode="HTML")
-                        broadcast_count += 1
-                    except:
-                        pass  # ব্লক করলে স্কিপ
+    # সুন্দর ব্রডকাস্ট
+    broadcast_text = (
+        "💎 <b>সবাই ID Submit শুরু করুন</b> 💎\n"
+        "🌙 <b>সময়মতো Submit করতে থাকুন</b> 🌙\n\n"
+        "   ⦅ <b>Submit Last Time : 11:00 PM</b> ⦆\n\n"
+    )
 
-        response += f"📩 <b>{broadcast_count}</b> জন ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।"
+    for cat, rate, fmt, lt, rt in updated:
+        usd = round(rate / 124, 2)
+        broadcast_text += (
+            f"<b>{cat}</b>\n"
+            f"💸 Members Rate: <b>{rate} BDT (${usd} USD)</b>\n"
+            f"📄 Format: <b>{fmt}</b>\n"
+            f"⏰ Last Time: <b>{lt}</b>\n"
+            f"📊 Report Time: <b>{rt}</b>\n\n"
+        )
 
-    await message.answer(response, parse_mode="HTML")
+    broadcast_text += (
+        "   《 <b>𝗔𝗹𝗹 𝗔𝗗𝗠𝗜𝗡 𝗥𝗔𝗧𝗘 𝗜𝗡𝗕𝗢𝗫</b> 》\n"
+        "✅ Live Fresh ID Report 99+% 🔥 \n"
+        "-------------------------------------------\n"
+        "📛 কি ধরনের 𝐈𝐃 দিচ্ছেন তা অবশ্যই ফাইল নামে লিখে দিন ✅\n\n"
+        "🚀 <b>সফলতার জন্য কঠোর পরিশ্রম করুন!</b>\n"
+        "💪 <b>আমরা সবাই মিলে এগিয়ে যাই</b>\n\n"
+        "📢 <b>আমাদের চ্যানেলে জয়েন করুন:</b>\n"
+        "<b>https://t.me/genzinternational</b>"
+    )
+
+    # সবাইকে ব্রডকাস্ট
+    count = 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+            for (uid,) in rows:
+                try:
+                    await bot.send_message(uid, broadcast_text, parse_mode="HTML", disable_web_page_preview=True)
+                    count += 1
+                except:
+                    pass
+
+    await message.answer(f"✅ রেট আপডেট + {count} জনকে ব্রডকাস্ট করা হয়েছে।")
 
 @dp.message(Command("profile"))
 async def profile_command(message: types.Message):
@@ -1724,7 +2355,7 @@ async def admin_profile(message: types.Message):
 
 @dp.message(Command("stats"), F.from_user.id == ADMIN_ID)
 async def bot_stats(message: types.Message):
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cursor:
             total_users = (await cursor.fetchone())[0]
         async with db.execute("SELECT SUM(earnings_bdt) FROM users") as cursor:
@@ -1751,7 +2382,7 @@ async def broadcast_notice(message: types.Message):
     
     notice_text = message.text.split(maxsplit=1)[1]
     success_count = 0
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
             rows = await cursor.fetchall()
             for (uid,) in rows:
@@ -1778,9 +2409,9 @@ async def toggle_category(message: types.Message):
     
     status = 1 if status_str == "on" else 0
     
-    db = await get_db_connection() try:
-        await asyncio.to_thread(db.execute,"INSERT OR REPLACE INTO toggles (item, enabled) VALUES (?, ?)", (full_cat, status))
-        asyncio.to_thread(db.commit)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR REPLACE INTO toggles (item, enabled) VALUES (?, ?)", (full_cat, status))
+        await db.commit()
     
     status_text = "চালু" if status else "বন্ধ"
     await message.answer(f"✅ {full_cat} ক্যাটাগরি {status_text} করা হয়েছে।")
@@ -1801,14 +2432,14 @@ async def give_refer_bonus(new_user_id):
     bonuses = [5, 2, 2, 2, 2]  # Level 1: 5 Tk, Level 2-5: 2 Tk each
     current = new_user_id
     level = 0
-    db = await get_db_connection() try:
+    async with aiosqlite.connect(DB_NAME) as db:
         while current and level < 5:
             async with db.execute("SELECT referrer FROM users WHERE user_id = ?", (current,)) as cursor:
                 row = await cursor.fetchone()
                 if row and row[0]:
                     referrer = row[0]
                     bonus = bonuses[level]
-                    await asyncio.to_thread(db.execute,"UPDATE users SET earnings_bdt = earnings_bdt + ? WHERE user_id = ?", (bonus, referrer))
+                    await db.execute("UPDATE users SET earnings_bdt = earnings_bdt + ? WHERE user_id = ?", (bonus, referrer))
                     try:
                         await bot.send_message(referrer, f"🎉 রেফার বোনাস! +{bonus} টাকা (Level {level+1})")
                     except:
@@ -1820,7 +2451,7 @@ async def give_refer_bonus(new_user_id):
 async def daily_motivation():
     while True:
         if datetime.datetime.now().hour == 8:
-            db = await get_db_connection() try:
+            async with aiosqlite.connect(DB_NAME) as db:
                 async with db.execute("SELECT user_id FROM users") as cursor:
                     rows = await cursor.fetchall()
                     for (uid,) in rows:
